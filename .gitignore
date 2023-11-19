@@ -1,0 +1,6 @@
+.vscode/
+build/
+CMakeLists.txt
+gui.ui
+/main_ard/*
+!/main_ard/src/

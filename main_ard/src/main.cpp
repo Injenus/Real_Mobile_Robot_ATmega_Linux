@@ -27,7 +27,7 @@
   Сначала шлёт МК, потом (по принятию) шлёт ПК
 */
 
-#define IS_TEST_UART 1
+#define IS_TEST_UART 0
 
 #if (!IS_TEST_UART)
 #include <I2Cdev.h>
@@ -45,6 +45,7 @@
 #define NUM_IR 2
 #define NUM_END 4
 #define DATA_NRF 6
+const uint8_t MODE = 2;
 
 struct Timer
 {
@@ -67,16 +68,16 @@ Timer tmr;
 struct Period
 {
   const uint32_t main = 0;
-  const uint32_t tx = 500;
-  const uint32_t rx = 19;
+  const uint32_t tx = 48;
+  const uint32_t rx = 49;
   const uint32_t nrf_t = 5;
   const uint32_t nrf_r = 5;
   const uint32_t set_wheel = 33;
   const uint32_t set_arm = 5;
   const uint32_t set_periph = 5;
-  const uint32_t check_mltx = 5;
+  const uint32_t check_mltx = 15;
   const uint32_t check_lidar = 5;
-  const uint32_t check_imu = 14;
+  const uint32_t check_imu = 15;
   const uint32_t check_odo = 5;
   const uint32_t check_nrf = 100;
 };
@@ -111,6 +112,7 @@ struct Multiplexor
       {1, 1, 0},
       {0, 0, 1},
       {1, 0, 1}};
+  int8_t pin_mode = 0;
 };
 
 struct Pin
@@ -145,31 +147,31 @@ struct Transmit
   char start_sb = '%';
   // char end_sb = ';';
   // char terminator = ',';
-  uint8_t hsum;
+  uint8_t hsum = 0x09;
   int16_t left_wh = 5;
   int16_t right_wh = 256;
-  int16_t mode_move = 1; // сейчас считаем это за индикатор состяния последней команды 1 - выполнено, 0 - выполняется
+  int16_t mode_move = 9; // сейчас считаем это за индикатор состяния последней команды 1 - выполнено, 0 - выполняется
   int16_t x_arm = 256;
   int16_t y_arm = -1;
   int16_t z_arm = -1;
   int16_t mode_arm = -1;
-  int16_t ax = -12345;
-  int16_t ay = -12345;
+  int16_t ax = -123;
+  int16_t ay = -1234;
   int16_t az = -12345;
-  int16_t gx = -12345;
-  int16_t gy = -12345;
+  int16_t gx = -123;
+  int16_t gy = -1234;
   int16_t gz = -12345;
-  int16_t ang_x = -12345;
-  int16_t ang_y = -12345;
+  int16_t ang_x = -123;
+  int16_t ang_y = -1234;
   int16_t ang_z = -12345;
-  int16_t odo_l = -1;
-  int16_t odo_r = -1;
-  int16_t lidar_angle = -1;
-  int16_t lidar_dist = -1;
-  int16_t sonar_1 = -1;
-  int16_t sonar_2 = -1;
-  int8_t ir = 0b00000000;       // 0b00000011
-  int8_t end_sens = 0b00000000; // 0b00001111
+  int16_t odo_l = 1;
+  int16_t odo_r = 2;
+  int16_t lidar_angle = 3;
+  int16_t lidar_dist = 4;
+  int16_t sonar_1 = 5;
+  int16_t sonar_2 = 6;
+  int8_t ir = 0b00000011;       // 0b00000011
+  int8_t end_sens = 0b00001111; // 0b00001111
 };
 Transmit tx;
 
@@ -191,7 +193,9 @@ struct Buff
 {
   volatile uint8_t rx[11]; // hsum + 2*1 + 3*2 + 2*1
   volatile uint8_t two_bytes[2];
-  volatile uint8_t tx[47]; // hsum + 22*2+2
+  volatile uint8_t tx[48]; // hsum + 22*2+2
+  volatile uint8_t tx_add[16];
+  volatile uint8_t nrf_rec[12];
 };
 Buff buff;
 volatile bool rx_flag = false;
@@ -222,11 +226,10 @@ struct Platform
 };
 Platform plat;
 
-const uint8_t MODE = 1;
-
 #if (!IS_TEST_UART)
 RF24 radio(pin.CE, pin.CSN);                                                // "создать" модуль на пинах 9 и 10 Для Уно
 byte address[][6] = {"1Node", "2Node", "3Node", "4Node", "5Node", "6Node"}; // возможные номера труб
+byte pipeNo;
 
 ServoDriverSmooth arm_servo[4](0x40);
 
@@ -277,7 +280,11 @@ void set_PWM_wheel(int16_t *left_sp, int16_t *right_sp);
 
 void setup()
 {
+  if (MODE < 2){
   Serial.begin(1000000);
+  }else{
+    Serial.begin(115200);
+  }
   Serial.setTimeout(10);
   Serial.print("Freq clock is ");
   Serial.print(F_CPU);
@@ -290,6 +297,12 @@ void setup()
   {
     pinMode(pin.mltx.s_ctrl[i], OUTPUT);
   }
+  if (MODE == 2){
+    pinMode(2, OUTPUT);
+    pinMode(3, OUTPUT);
+  }
+
+  buff.tx[0] = uint8_t(tx.start_sb);
 
   //  UCSROB = (1<<RXEND) | (1<<RXCIEO); // разрешение перрваания по получению
 }
@@ -315,7 +328,7 @@ void loop()
 #endif
       // ctrl by nrf
     }
-    else
+    else if (MODE > 0)
     {
 #if (!IS_TEST_UART)
       /// опрос всего
@@ -472,6 +485,23 @@ void loop()
 #if (!IS_TEST_UART)
 void nrf_set()
 {
+  if (MODE == 2){
+radio.begin();              // активировать модуль
+  radio.setAutoAck(1);        // режим подтверждения приёма, 1 вкл 0 выкл
+  radio.setRetries(0, 15);    // (время между попыткой достучаться, число попыток)
+  radio.enableAckPayload();   // разрешить отсылку данных в ответ на входящий сигнал
+  radio.setPayloadSize(32);   // размер пакета, в байтах
+  radio.openWritingPipe(address[0]);   // мы - труба 0, открываем канал для передачи данных
+  radio.setChannel(0x6a);            // выбираем канал (в котором нет шумов!)
+  radio.setPALevel(RF24_PA_MAX);         // уровень мощности передатчика
+  radio.setDataRate(RF24_2MBPS);        // скорость обмена
+  // должна быть одинакова на приёмнике и передатчике!
+  // при самой низкой скорости имеем самую высокую чувствительность и дальность!!
+
+  radio.powerUp();         // начать работу
+  radio.stopListening();   // не слушаем радиоэфир, мы передатчик
+  }
+  else {
   radio.begin();            // активировать модуль
   radio.setAutoAck(1);      // режим подтверждения приёма, 1 вкл 0 выкл
   radio.setRetries(0, 15);  // (время между попыткой достучаться, число попыток)
@@ -482,9 +512,10 @@ void nrf_set()
   radio.setChannel(0x6a);               // выбираем канал (в котором нет шумов!)
 
   radio.setPALevel(RF24_PA_MAX);   // уровень мощности передатчика. На выбор RF24_PA_MIN, RF24_PA_LOW, RF24_PA_HIGH, RF24_PA_MAX
-  radio.setDataRate(RF24_250KBPS); // скорость обмена. На выбор RF24_2MBPS, RF24_1MBPS, RF24_250KBPS
+  radio.setDataRate(RF24_2MBPS); // скорость обмена. На выбор RF24_2MBPS, RF24_1MBPS, RF24_250KBPS
   radio.powerUp();                 // начать работу
   radio.startListening();          // начинаем слушать эфир, мы приёмный модуль
+  }
 }
 
 void mpu_set()
@@ -497,12 +528,37 @@ void mpu_set()
 
 void tx_uart()
 {
-  Serial.write(tx.start_sb);
-  send_buff(buff.tx, 47);
+  //Serial.println("TX");
+  if (MODE == 1){
+    //Serial.write(tx.start_sb);
+    send_buff(buff.tx, 48);
+  }
+  else if (MODE == 2){
+    #if (!IS_TEST_UART)
+    for (uint8_t i = 0; i<16; i++){
+      buff.tx_add[i] = buff.tx[32+i];
+    }
+    radio.write(&buff.tx, 32);
+    radio.write(&buff.tx_add, 16);
+    if (!radio.available()) {   // если получаем пустой ответ
+      } 
+    else {
+      while (radio.available() ) {                    // если в ответе что-то есть
+        radio.read(&buff.nrf_rec, 12);    // читаем
+        // получили забитый данными массив telemetry ответа от приёмника
+        for (uint8_t i = 0; i<11;i++){
+          buff.rx[0] = buff.nrf_rec[i+1];
+        }
+      }
+    }
+    #endif
+  }
 }
 
 void rx_uart()
 {
+  //Serial.println("RX");
+  if (MODE == 1){
   static uint8_t i;
   if (Serial.available())
   {
@@ -530,6 +586,11 @@ void rx_uart()
     }
   }
 }
+else if (MODE == 2){
+ 
+}
+}
+
 void send_buff(uint8_t *buff, uint8_t size)
 {
   for (uint8_t i = 0; i < size; i++)
@@ -610,9 +671,12 @@ void get_imu()
     mpu.dmpGetGravity(&gravity, &q);
     mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
 
-    tx.ang_x = degrees(ypr[2]) * 1000;
-    tx.ang_y = degrees(ypr[1]) * 1000;
-    tx.ang_z = degrees(ypr[0]) * 1000;
+    // tx.ang_x = degrees(ypr[2]) * 1000;
+    // tx.ang_y = degrees(ypr[1]) * 1000;
+    // tx.ang_z = degrees(ypr[0]) * 1000;
+    tx.ang_x = ypr[2] * 1000;
+    tx.ang_y = ypr[1] * 1000;
+    tx.ang_z = ypr[0] * 1000;
   }
 }
 void set_mltx(uint8_t *mode, uint8_t *val_map)
@@ -637,16 +701,16 @@ void set_mltx(uint8_t *mode, uint8_t *val_map)
 
 void get_mltx()
 {
-  tx.ir = 0;
+  tx.ir = 0b00000000;
   for (uint8_t i = 0; i < NUM_IR; i++)
   {
-    set_mltx((uint8_t *)0, pin.mltx.ir[i]);
+    set_mltx(&pin.mltx.pin_mode, pin.mltx.ir[i]);
     tx.ir = tx.ir | (digitalRead(pin.mltx.sig) << i);
   }
-  tx.end_sens = 0;
+  tx.end_sens = 0b00000000;
   for (uint8_t i = 0; i < NUM_END; i++)
   {
-    set_mltx((uint8_t *)0, pin.mltx.end_sens[i]);
+    set_mltx(&pin.mltx.pin_mode, pin.mltx.end_sens[i]);
     tx.end_sens = tx.end_sens | (digitalRead(pin.mltx.sig) << i);
   }
 }
@@ -725,7 +789,7 @@ bool check_data(uint8_t *data_rec, uint32_t start_i, uint32_t end_i)
 
 void fill_tx_arr()
 {
-  uint8_t i = 1;
+  uint8_t i = 2;
   //  int16_t left_wh = 5;
   //  int16_t right_wh = -1;
   //  int16_t mode_move = -1;
@@ -807,7 +871,8 @@ void fill_tx_arr()
   buff.tx[i++] = from_int8(tx.ir);
   buff.tx[i++] = from_int8(tx.end_sens);
   // hash sum
-  buff.tx[0] = hash(buff.tx, 1, 47);
+  //buff.tx[0] = hash(buff.tx, 1, 47);
+  buff.tx[1] = tx.hsum;
 }
 // ####################### for robot #######
 void set_PWM_wheel(int16_t *left_sp, int16_t *right_sp) // принимает абстрактную уставку от -1000 до 1000

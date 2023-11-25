@@ -37,6 +37,7 @@
 #include <RF24.h>
 #include <Adafruit_VL53L0X.h>
 #include <ServoDriverSmooth.h>
+#include <Servo.h>
 #endif
 // #include <stdint.h>
 #include <Arduino.h>
@@ -72,8 +73,8 @@ struct Period
   const uint32_t rx = 49;
   const uint32_t nrf_t = 5;
   const uint32_t nrf_r = 5;
-  const uint32_t set_wheel = 33;
-  const uint32_t set_arm = 5;
+  const uint32_t set_wheel = 30;
+  const uint32_t set_arm = 30;
   const uint32_t set_periph = 5;
   const uint32_t check_mltx = 15;
   const uint32_t check_lidar = 5;
@@ -148,12 +149,12 @@ struct Transmit
   // char end_sb = ';';
   // char terminator = ',';
   uint8_t hsum = 0x09;
-  int16_t left_wh = 5;
-  int16_t right_wh = 256;
-  int16_t mode_move = 9; // сейчас считаем это за индикатор состяния последней команды 1 - выполнено, 0 - выполняется
-  int16_t x_arm = 256;
-  int16_t y_arm = -1;
-  int16_t z_arm = -1;
+  int16_t left_wh = 0;
+  int16_t right_wh = 0;
+  int16_t mode_move = 3; // сейчас считаем это за индикатор состяния последней команды 1 - выполнено, 0 - выполняется
+  int16_t x_arm = 90;
+  int16_t y_arm = 90;
+  int16_t z_arm = 90;
   int16_t mode_arm = -1;
   int16_t ax = -123;
   int16_t ay = -1234;
@@ -179,8 +180,8 @@ struct Receive
 {
   char init_sb = '#';
   uint8_t hsum = 9;
-  int8_t move_type = -1;
-  int8_t val_move = -1;
+  int8_t move_type = 0;
+  int8_t val_move = 0;
   int16_t arm_q1 = 90;
   int16_t arm_q2 = 90;
   int16_t arm_q3 = 90;
@@ -191,7 +192,7 @@ Receive rx;
 
 struct Buff
 {
-  volatile uint8_t rx[11]; // hsum + 2*1 + 3*2 + 2*1
+  volatile uint8_t rx[11] = {0, 0, 3, 3, 3, 3, 3, 3, 3, 3, 3}; // hsum + 2*1 + 3*2 + 2*1
   volatile uint8_t two_bytes[2];
   volatile uint8_t tx[48]; // hsum + 22*2+2
   volatile uint8_t tx_add[16];
@@ -211,17 +212,40 @@ struct Pid
   int32_t constr[2] = {100, 1000};
 };
 
+struct MG_996_R_360
+{
+  int16_t const dead_zone = 21; // +- relative to 90
+  int16_t const min_v = 0;      // >=0 <90    55 is good
+  int16_t const stop_v = 90;    //
+  int16_t const max_v = 180;    // >90 <=180   125 is good
+  int16_t const min_prd = 600;
+  int16_t const stop_prd = 1500;
+  int16_t const max_prd = 2400;
+};
+MG_996_R_360 mg996;
+
+const uint8_t WHEEL_NUM = 2;
+struct Wheel
+{
+  Servo servo[WHEEL_NUM];
+  bool const is_direct[WHEEL_NUM] = {true, false};
+  int16_t const min_spd = -1000;
+  int16_t const max_spd = 1000;
+  int16_t abstr_spd[WHEEL_NUM] = {0, 0};
+};
+Wheel wheel;
+
 struct Platform
 {
   int16_t loc_init_ang[3] = {0, 0, 0}; // x y z
   int16_t target_type = 0;
   int16_t target_val = 0;
-  bool is_done_move = false;
+  // bool is_done_move = false;
   uint32_t tmr[5] = {0, 0, 0, 0, 0};
-  uint32_t prd[5] = {500, 500, 500, 3600000, 3600000};
-  int16_t stop[2] = {0, 0};
-  int16_t forw[2] = {100, -100};
-  int16_t backw[2] = {-100, 100};
+  uint32_t prd[5] = {750, 750, 750, 3600000, 3600000};
+  int16_t stop[WHEEL_NUM] = {0, 0};
+  int16_t forw[WHEEL_NUM] = {wheel.max_spd * 0.005, -wheel.max_spd * 0.005};
+  int16_t backw[WHEEL_NUM] = {wheel.min_spd * 0.005, -wheel.min_spd * 0.005};
   Pid pid;
 };
 Platform plat;
@@ -229,7 +253,7 @@ Platform plat;
 #if (!IS_TEST_UART)
 RF24 radio(pin.CE, pin.CSN);                                                // "создать" модуль на пинах 9 и 10 Для Уно
 byte address[][6] = {"1Node", "2Node", "3Node", "4Node", "5Node", "6Node"}; // возможные номера труб
-byte pipeNo;
+byte pipeNo = 1;
 
 ServoDriverSmooth arm_servo[4](0x40);
 
@@ -268,7 +292,9 @@ void send_buff(uint8_t *buff, uint8_t size);
 void fill_tx_arr();
 void buff_to_tx_buff(uint8_t *ind, uint8_t *int_buff);
 
-void set_PWM_wheel(int16_t *left_sp, int16_t *right_sp);
+void set_PWM_wheel(int16_t left_sp, int16_t right_sp);
+void set_directly_wheel(int16_t left_val, int16_t right_val);
+int16_t convertSpeedToVal(int16_t speed_);
 /*
  *  не регаируем на поток байтов, пока не увидим #
  *  после этого всё приходящее кладём в rx_buffer
@@ -280,9 +306,12 @@ void set_PWM_wheel(int16_t *left_sp, int16_t *right_sp);
 
 void setup()
 {
-  if (MODE < 2){
-  Serial.begin(1000000);
-  }else{
+  if (MODE < 2)
+  {
+    Serial.begin(1000000);
+  }
+  else
+  {
     Serial.begin(115200);
   }
   Serial.setTimeout(10);
@@ -297,9 +326,15 @@ void setup()
   {
     pinMode(pin.mltx.s_ctrl[i], OUTPUT);
   }
-  if (MODE == 2){
-    pinMode(2, OUTPUT);
-    pinMode(3, OUTPUT);
+
+  pinMode(2, OUTPUT);
+  pinMode(3, OUTPUT);
+
+  wheel.servo[0].attach(pin.left_wh, mg996.min_prd, mg996.max_prd);
+  wheel.servo[1].attach(pin.right_wh, mg996.min_prd, mg996.max_prd);
+  for (int i = 0; i < WHEEL_NUM; i++)
+  {
+    wheel.servo[i].write(90);
   }
 
   buff.tx[0] = uint8_t(tx.start_sb);
@@ -358,11 +393,12 @@ void loop()
       if (millis() - tmr.tx > PRD.tx)
       {
         tmr.tx = millis();
+        // Serial.println("TX");
         fill_tx_arr(); // заполнение массива на отправку собранными данными
         tx_uart();     // отправка
       }
       // приём, чек, парсинг и устанвока упарвляющей инфы
-      if (millis() - tmr.rx > PRD.rx)
+      if (millis() - tmr.rx > PRD.rx && MODE != 2)
       {
         tmr.rx = millis();
         rx_uart(); // так вышло, что тут всё, - приняли и уставки сразу актуальные, если прошло проверку
@@ -372,63 +408,73 @@ void loop()
       if (millis() - tmr.set_wheel > PRD.set_wheel)
       {
         tmr.set_wheel = millis();
-        if (plat.is_done_move)
-        { // если зaвершили предыдущее движение, то делаем иниты для движения
-          plat.target_type = rx.move_type;
-          plat.target_val = rx.val_move;
+        if (tx.mode_move != 0)
+        {
+          digitalWrite(3, 0);
+          // если зaвершили предыдущее движение, то делаем иниты для движения
+          plat.target_type = constrain(rx.move_type, 0, 4);
+          rx.move_type = 0;
+          plat.target_val = -rx.val_move * 17; // 17.453  Ded to Mrad
+          rx.val_move = 0;
 
           plat.loc_init_ang[2] = tx.ang_z;
           for (uint8_t i = 0; i < 5; i++)
           {
             plat.tmr[i] = millis();
           }
-          plat.is_done_move = false;
+          // plat.is_done_move = false;
           tx.mode_move = 0;
         }
-        else // а если не завершили, то делаем движение, че ждём-то
+        else if (tx.mode_move == 0) // а если не завершили, то делаем движение, че ждём-то
         {
+          digitalWrite(3, 1);
+          digitalWrite(2, !plat.target_type);
           switch (plat.target_type)
           {
           case 0: // stop
-            set_PWM_wheel(&plat.stop[0], &plat.stop[1]);
+            set_PWM_wheel(plat.stop[0], plat.stop[1]);
             if (millis() - plat.tmr[plat.target_type] > plat.prd[plat.target_type])
             {
-              plat.is_done_move = true;
+              // plat.is_done_move = true;
               tx.mode_move = 1;
             }
             break;
           case 1: // прямо по углу z
-            //
+            // set_PWM_wheel(plat.forw[0], plat.forw[1]);
+            set_directly_wheel(mg996.stop_v + mg996.dead_zone, mg996.stop_v - mg996.dead_zone);
             if (millis() - plat.tmr[plat.target_type] > plat.prd[plat.target_type])
             {
-              plat.is_done_move = true;
+              // plat.is_done_move = true;
               tx.mode_move = 1;
             }
             break;
           case 2: // назад по углу z
-            //
+            // set_PWM_wheel(plat.backw[0], plat.backw[1]);
+            set_directly_wheel(mg996.stop_v - mg996.dead_zone, mg996.stop_v + mg996.dead_zone);
             if (millis() - plat.tmr[plat.target_type] > plat.prd[plat.target_type])
             {
-              plat.is_done_move = true;
+              // plat.is_done_move = true;
               tx.mode_move = 1;
             }
             break;
           case 3: // вращение вокруг центра оси  ang>=0 - против час.  ang<0 - по час.
             if (plat.target_val > 0)
             {
-              set_PWM_wheel(&plat.backw[0], &plat.forw[1]);
+              // set_PWM_wheel(plat.backw[0], plat.forw[1]);
+              set_directly_wheel(mg996.stop_v - mg996.dead_zone, mg996.stop_v - mg996.dead_zone);
               if (tx.ang_z - plat.loc_init_ang[2] > plat.target_val)
               {
-                plat.is_done_move = true;
+                // plat.is_done_move = true;
                 tx.mode_move = 1;
               }
             }
             else
             {
-              set_PWM_wheel(&plat.forw[0], &plat.backw[1]);
+              // set_PWM_wheel(plat.forw[0], plat.backw[1]);
+              set_directly_wheel(mg996.stop_v + mg996.dead_zone, mg996.stop_v + mg996.dead_zone);
               if (tx.ang_z - plat.loc_init_ang[2] < plat.target_val)
               {
-                plat.is_done_move = true;
+                // plat.is_done_move = true;
                 tx.mode_move = 1;
               }
             }
@@ -437,25 +483,28 @@ void loop()
           case 4: // вращение вокруг колеса ang>=0 - против час.  ang<0 - по час.
             if (plat.target_val > 0)
             {
-              set_PWM_wheel(&plat.stop[0], &plat.forw[1]);
+              // set_PWM_wheel(plat.stop[0], plat.forw[1]);
+              set_directly_wheel(mg996.stop_v, mg996.stop_v - mg996.dead_zone);
               if (tx.ang_z - plat.loc_init_ang[2] > plat.target_val)
               {
-                plat.is_done_move = true;
+                // plat.is_done_move = true;
                 tx.mode_move = 1;
               }
             }
             else
             {
-              set_PWM_wheel(&plat.forw[0], &plat.stop[1]);
+              // set_PWM_wheel(plat.forw[0], plat.stop[1]);
+              set_directly_wheel(mg996.stop_v + mg996.dead_zone, mg996.stop_v);
               if (tx.ang_z - plat.loc_init_ang[2] < plat.target_val)
               {
-                plat.is_done_move = true;
+                // plat.is_done_move = true;
                 tx.mode_move = 1;
               }
             }
             break;
           default:
             // КАКАЯ_ТО ОШИБКА!!!!!!!!!!
+            tx.mode_move = 9;
             break;
           }
           /*точка выхода в аждом кейсе*/
@@ -471,7 +520,11 @@ void loop()
       if (millis() - tmr.set_arm > PRD.set_arm)
       {
         tmr.set_arm = millis();
-        /**/
+
+        tx.x_arm = rx.arm_q1;
+        tx.y_arm = rx.arm_q2;
+        tx.z_arm = rx.arm_q3;
+        tx.mode_arm = rx.arm_mode;
       }
       // уставнока периферии (магнит, аудио, ещё какая-нибудь хрень)
       if (millis() - tmr.set_periph > PRD.set_periph)
@@ -485,36 +538,39 @@ void loop()
 #if (!IS_TEST_UART)
 void nrf_set()
 {
-  if (MODE == 2){
-radio.begin();              // активировать модуль
-  radio.setAutoAck(1);        // режим подтверждения приёма, 1 вкл 0 выкл
-  radio.setRetries(0, 15);    // (время между попыткой достучаться, число попыток)
-  radio.enableAckPayload();   // разрешить отсылку данных в ответ на входящий сигнал
-  radio.setPayloadSize(32);   // размер пакета, в байтах
-  radio.openWritingPipe(address[0]);   // мы - труба 0, открываем канал для передачи данных
-  radio.setChannel(0x6a);            // выбираем канал (в котором нет шумов!)
-  radio.setPALevel(RF24_PA_MAX);         // уровень мощности передатчика
-  radio.setDataRate(RF24_2MBPS);        // скорость обмена
-  // должна быть одинакова на приёмнике и передатчике!
-  // при самой низкой скорости имеем самую высокую чувствительность и дальность!!
+  if (MODE == 2)
+  {
+    radio.begin();                        // активировать модуль
+    radio.setAutoAck(1);                  // режим подтверждения приёма, 1 вкл 0 выкл
+    radio.setRetries(0, 15);              // (время между попыткой достучаться, число попыток)
+    radio.enableAckPayload();             // разрешить отсылку данных в ответ на входящий сигнал
+    radio.setPayloadSize(32);             // размер пакета, в байтах
+    radio.openWritingPipe(address[0]);    // мы - труба 0, открываем канал для передачи данных
+    radio.openReadingPipe(1, address[0]); // хотим слушать трубу 0
+    radio.setChannel(0x6a);               // выбираем канал (в котором нет шумов!)
+    radio.setPALevel(RF24_PA_MAX);        // уровень мощности передатчика
+    radio.setDataRate(RF24_2MBPS);        // скорость обмена
+    // должна быть одинакова на приёмнике и передатчике!
+    // при самой низкой скорости имеем самую высокую чувствительность и дальность!!
 
-  radio.powerUp();         // начать работу
-  radio.stopListening();   // не слушаем радиоэфир, мы передатчик
+    radio.powerUp();       // начать работу
+    radio.stopListening(); // не слушаем радиоэфир, мы передатчик
   }
-  else {
-  radio.begin();            // активировать модуль
-  radio.setAutoAck(1);      // режим подтверждения приёма, 1 вкл 0 выкл
-  radio.setRetries(0, 15);  // (время между попыткой достучаться, число попыток)
-  radio.enableAckPayload(); // разрешить отсылку данных в ответ на входящий сигнал
-  radio.setPayloadSize(32); // размер пакета, в байтах
+  else
+  {
+    radio.begin();            // активировать модуль
+    radio.setAutoAck(1);      // режим подтверждения приёма, 1 вкл 0 выкл
+    radio.setRetries(0, 15);  // (время между попыткой достучаться, число попыток)
+    radio.enableAckPayload(); // разрешить отсылку данных в ответ на входящий сигнал
+    radio.setPayloadSize(32); // размер пакета, в байтах
 
-  radio.openReadingPipe(1, address[0]); // хотим слушать трубу 0
-  radio.setChannel(0x6a);               // выбираем канал (в котором нет шумов!)
+    radio.openReadingPipe(1, address[0]); // хотим слушать трубу 0
+    radio.setChannel(0x6a);               // выбираем канал (в котором нет шумов!)
 
-  radio.setPALevel(RF24_PA_MAX);   // уровень мощности передатчика. На выбор RF24_PA_MIN, RF24_PA_LOW, RF24_PA_HIGH, RF24_PA_MAX
-  radio.setDataRate(RF24_2MBPS); // скорость обмена. На выбор RF24_2MBPS, RF24_1MBPS, RF24_250KBPS
-  radio.powerUp();                 // начать работу
-  radio.startListening();          // начинаем слушать эфир, мы приёмный модуль
+    radio.setPALevel(RF24_PA_MAX); // уровень мощности передатчика. На выбор RF24_PA_MIN, RF24_PA_LOW, RF24_PA_HIGH, RF24_PA_MAX
+    radio.setDataRate(RF24_2MBPS); // скорость обмена. На выбор RF24_2MBPS, RF24_1MBPS, RF24_250KBPS
+    radio.powerUp();               // начать работу
+    radio.startListening();        // начинаем слушать эфир, мы приёмный модуль
   }
 }
 
@@ -528,67 +584,76 @@ void mpu_set()
 
 void tx_uart()
 {
-  //Serial.println("TX");
-  if (MODE == 1){
-    //Serial.write(tx.start_sb);
+  // Serial.println("TX");
+  if (MODE == 1)
+  {
+    // Serial.write(tx.start_sb);
     send_buff(buff.tx, 48);
   }
-  else if (MODE == 2){
-    #if (!IS_TEST_UART)
-    for (uint8_t i = 0; i<16; i++){
-      buff.tx_add[i] = buff.tx[32+i];
+  else if (MODE == 2)
+  {
+#if (!IS_TEST_UART)
+    for (uint8_t i = 0; i < 16; i++)
+    {
+      buff.tx_add[i] = buff.tx[32 + i];
     }
     radio.write(&buff.tx, 32);
     radio.write(&buff.tx_add, 16);
-    if (!radio.available()) {   // если получаем пустой ответ
-      } 
-    else {
-      while (radio.available() ) {                    // если в ответе что-то есть
-        radio.read(&buff.nrf_rec, 12);    // читаем
+    if (!radio.available(&pipeNo))
+    { // если получаем пустой ответ
+    }
+    else
+    {
+      while (radio.available(&pipeNo))
+      {                                // если в ответе что-то есть
+        radio.read(&buff.nrf_rec, 12); // читаем
         // получили забитый данными массив telemetry ответа от приёмника
-        for (uint8_t i = 0; i<11;i++){
-          buff.rx[0] = buff.nrf_rec[i+1];
+        for (uint8_t i = 0; i < 11; i++)
+        {
+          buff.rx[i] = buff.nrf_rec[i + 1];
         }
       }
+      update_control_data();
     }
-    #endif
+#endif
   }
 }
 
 void rx_uart()
 {
-  //Serial.println("RX");
-  if (MODE == 1){
-  static uint8_t i;
-  if (Serial.available())
+  // Serial.println("RX");
+  if (MODE == 1)
   {
-    // Serial.println();
-    if (rx_flag)
+    static uint8_t i;
+    if (Serial.available())
     {
-      buff.rx[i++] = Serial.read();
-      // Serial.println(int8_t(rx_buff[i-1]));
-      if (i > 10)
+      // Serial.println();
+      if (rx_flag)
       {
-        rx_flag = false;
-        i = 0;
-        // send_buff();
-        update_control_data();
+        buff.rx[i++] = Serial.read();
+        // Serial.println(int8_t(rx_buff[i-1]));
+        if (i > 10)
+        {
+          rx_flag = false;
+          i = 0;
+          // send_buff();
+          update_control_data();
+        }
       }
-    }
-    else
-    {
-      if (char(Serial.read()) == rx.init_sb)
+      else
       {
-        // Serial.println(rx.init_sb);
-        rx_flag = true;
-        i = 0;
+        if (char(Serial.read()) == rx.init_sb)
+        {
+          // Serial.println(rx.init_sb);
+          rx_flag = true;
+          i = 0;
+        }
       }
     }
   }
-}
-else if (MODE == 2){
- 
-}
+  else if (MODE == 2)
+  {
+  }
 }
 
 void send_buff(uint8_t *buff, uint8_t size)
@@ -623,13 +688,14 @@ void update_control_data()
   }
   else
   {
-    rx.move_type = -1;
-    rx.val_move = -1;
-    //    rx.arm_q1 = ;
-    //    rx.arm_q2 = to_int16(rx_buff[5], rx_buff[6], &i);
-    //    rx.arm_q3 = to_int16(rx_buff[7], rx_buff[8], &i);
-    //    rx.arm_mode = to_int8(rx_buff[9]);
-    rx.auido_mode = -1;
+    uint8_t i = 0;
+    rx.move_type = to_int8(buff.rx[1]);
+    rx.val_move = to_int8(buff.rx[2]);
+    rx.arm_q1 = to_int16(buff.rx[3], buff.rx[4], &i);
+    rx.arm_q2 = to_int16(buff.rx[5], buff.rx[6], &i);
+    rx.arm_q3 = to_int16(buff.rx[7], buff.rx[8], &i);
+    rx.arm_mode = to_int8(buff.rx[9]);
+    rx.auido_mode = 0;
   }
 }
 
@@ -831,6 +897,14 @@ void fill_tx_arr()
   buff_to_tx_buff(&i, buff.two_bytes);
   from_int16(tx.mode_arm, buff.two_bytes);
   buff_to_tx_buff(&i, buff.two_bytes);
+  // from_int16(rx.arm_q1, buff.two_bytes);
+  // buff_to_tx_buff(&i, buff.two_bytes);
+  // from_int16(rx.arm_q2, buff.two_bytes);
+  // buff_to_tx_buff(&i, buff.two_bytes);
+  // from_int16(rx.arm_q2, buff.two_bytes);
+  // buff_to_tx_buff(&i, buff.two_bytes);
+  // from_int16(rx.arm_mode, buff.two_bytes);
+  // buff_to_tx_buff(&i, buff.two_bytes);
   // accel
   from_int16(tx.ax, buff.two_bytes);
   buff_to_tx_buff(&i, buff.two_bytes);
@@ -871,12 +945,38 @@ void fill_tx_arr()
   buff.tx[i++] = from_int8(tx.ir);
   buff.tx[i++] = from_int8(tx.end_sens);
   // hash sum
-  //buff.tx[0] = hash(buff.tx, 1, 47);
+  // buff.tx[0] = hash(buff.tx, 1, 47);
   buff.tx[1] = tx.hsum;
 }
 // ####################### for robot #######
-void set_PWM_wheel(int16_t *left_sp, int16_t *right_sp) // принимает абстрактную уставку от -1000 до 1000
+void set_PWM_wheel(int16_t left_sp, int16_t right_sp) // принимает абстрактную уставку от -1000 до 1000
 {
+  tx.left_wh = convertSpeedToVal(left_sp);
+  tx.right_wh = convertSpeedToVal(right_sp);
+  wheel.servo[0].write(tx.left_wh);
+  wheel.servo[1].write(tx.right_wh);
+}
+void set_directly_wheel(int16_t left_val, int16_t right_val)
+{
+  tx.left_wh = left_val;
+  tx.right_wh = right_val;
+  wheel.servo[0].write(tx.left_wh);
+  wheel.servo[1].write(tx.right_wh);
+}
+
+int16_t convertSpeedToVal(int16_t speed_)
+{
+  speed_ = constrain(speed_, wheel.min_spd, wheel.max_spd);
+  int16_t val = 90;
+  if (speed_ < 0)
+  {
+    val = map(speed_, wheel.min_spd, 1, mg996.min_v, mg996.stop_v - mg996.dead_zone);
+  }
+  else if (speed_ > 0)
+  {
+    val = map(speed_, 1, wheel.max_spd, mg996.stop_v + mg996.dead_zone, mg996.max_v);
+  }
+  return val;
 }
 int16_t wheel_corr() // пид регулятор для колёс
 {
